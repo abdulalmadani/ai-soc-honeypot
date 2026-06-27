@@ -44,6 +44,25 @@ GEMINI_MODEL = "gemini-2.5-flash"
 # Deterministic-rule threshold: an AbuseIPDB score at or above this counts as "high abuse".
 HIGH_ABUSE_THRESHOLD = 50
 
+# Known benign internet-wide research scanners. If an alert's ISP/org matches one of
+# these (case-insensitive substring) AND there was no successful login, we treat the
+# traffic as scanning noise regardless of volume. Extend this list as you spot more.
+KNOWN_SCANNER_ORGS = (
+    "censys",
+    "shodan",
+    "stretchoid",
+    "binaryedge",
+    "rapid7",
+    "shadowserver",
+    "onyphe",
+    "leakix",
+    "driftnet",
+    "internet-census",
+    "net systems research",
+    "alpha strike labs",
+    "securitytrails",
+)
+
 
 # The KQL query we send to the workspace:
 #   1. Keep only Windows failed-logon events (EventID 4625).
@@ -244,6 +263,14 @@ class TriageDecision(BaseModel):
     explanation: str        # 2-3 sentences of reasoning
 
 
+def _is_known_scanner(isp):
+    """Return True if the ISP/org string matches a known benign research scanner."""
+    if not isp:
+        return False
+    isp_lower = isp.lower()
+    return any(org in isp_lower for org in KNOWN_SCANNER_ORGS)
+
+
 def classify_alert(alert):
     """Ask Gemini to classify one enriched alert, then apply deterministic override rules.
 
@@ -312,13 +339,23 @@ Return:
     final_severity = model_severity
     override_reason = None
 
-    # Rule: if the attacker actually got in (successful login) from a high-abuse IP,
+    # Rule 1: if the attacker actually got in (successful login) from a high-abuse IP,
     # it is a critical true positive no matter what the model concluded.
     if successful_login and abuse_score is not None and abuse_score >= HIGH_ABUSE_THRESHOLD:
         final_verdict = "true positive"
         final_severity = "critical"
         override_reason = (f"successful login from IP with abuse score "
                            f"{abuse_score} >= {HIGH_ABUSE_THRESHOLD} -> forced critical")
+
+    # Rule 2: a known benign research scanner (Censys, Shodan, ...) with NO successful
+    # login is internet-wide scanning noise, not a targeted attack -- cap it at
+    # false positive / low regardless of how many failed attempts it generated.
+    # (Mutually exclusive with Rule 1, which requires a successful login.)
+    elif _is_known_scanner(isp) and not successful_login:
+        final_verdict = "false positive"
+        final_severity = "low"
+        override_reason = (f"ISP '{isp}' is a known benign scanner and no successful "
+                           f"login occurred -> capped at false positive / low")
 
     # --- 5. Hand back model vs. final so the caller can compare them ---
     return {
