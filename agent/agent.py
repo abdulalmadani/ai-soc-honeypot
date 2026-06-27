@@ -9,7 +9,7 @@ to sign in more than 10 times within a single hour over the last 24 hours.
 import os
 import json
 import time
-from datetime import timedelta
+from datetime import timedelta, datetime
 from enum import Enum
 from pathlib import Path
 
@@ -25,6 +25,9 @@ from azure.monitor.query import LogsQueryClient, LogsQueryStatus  # runs KQL aga
 # The .env file lives in the repo root, one level above this agent/ folder. Resolving
 # it from __file__ means the script finds it no matter which directory you run it from.
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+# Reports are written to a /reports folder in the repo root (also resolved absolutely).
+REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 
 # --- Threat-intel API endpoints ---
 ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check"
@@ -357,38 +360,173 @@ def print_decision(result):
     print()
 
 
-# --- Quick manual test: run `python agent/agent.py` to classify the alerts ---
-if __name__ == "__main__":
-    # Pull real alerts and enrich them (this takes ~90s due to VirusTotal throttling).
-    alerts = enrich_alerts(get_brute_force_alerts())
+# ---------------------------------------------------------------------------
+# Reporting step: classify every alert, then build one deduped, ranked report.
+# ---------------------------------------------------------------------------
 
-    print("=== Gemini triage on real alerts (one per unique IP) ===\n")
-    seen = set()
+# Severity ordering for sorting: critical first, then high, medium, low.
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def _cell(value):
+    """Render a value for a table cell, showing '-' instead of a bare None."""
+    return str(value) if value is not None else "-"
+
+
+def _truncate(text, limit):
+    """Shorten long text so a table row stays on one line (ASCII ellipsis)."""
+    text = str(text)
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def _severity_counts(report):
+    """Count how many alerts fall into each severity bucket."""
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for row in report:
+        counts[row["severity"]] = counts.get(row["severity"], 0) + 1
+    return counts
+
+
+def build_triage_report(alerts):
+    """Classify all alerts, deduplicate by IP, and sort into a single ranked report.
+
+    Returns a list of plain (JSON-friendly) dicts, one per attacker IP, sorted by
+    severity (critical first) and then by AbuseIPDB score (highest first).
+    """
+    # --- 1. Collapse the per-hour alert rows into one entry per IP ---
+    # An IP shows up once per noisy hour, so we sum its failed attempts into a single
+    # 24-hour total and reuse its (per-IP) enrichment data.
+    by_ip = {}
     for alert in alerts:
-        if alert["ip_address"] in seen:
-            continue                         # the facts are per-IP, so classify each IP once
-        seen.add(alert["ip_address"])
-        print_decision(classify_alert(alert))
+        ip = alert["ip_address"]
+        if ip not in by_ip:
+            by_ip[ip] = {
+                "ip_address": ip,
+                "failed_attempts": 0,
+                "enrichment": alert["enrichment"],
+                "time_generated": alert.get("time_generated"),
+            }
+        by_ip[ip]["failed_attempts"] += alert["failed_attempts"]
 
-    # None of the real attackers actually logged in, so the override rule never fires above.
-    # This synthetic alert is deliberately BORDERLINE — only a moderate abuse score and ZERO
-    # VirusTotal hits, so Gemini may rate it medium/high — but it had a successful login,
-    # which trips our rule and forces CRITICAL. That makes the override visible.
-    print("=== Synthetic case: successful login from a high-abuse IP (demonstrates override) ===\n")
-    synthetic_alert = {
-        "ip_address": "203.0.113.66",        # RFC 5737 TEST-NET address, safe placeholder
-        "failed_attempts": 11,               # barely over the alerting threshold
-        "time_generated": "(synthetic)",
-        "enrichment": {
-            # Looks fairly benign to a model — reputable cloud provider, ZERO VirusTotal
-            # hits, abuse score right at the threshold, ordinary username. A model may well
-            # rate this only medium/high. But there was a successful login, which our rule
-            # treats as critical regardless. This is the "model under-rates it" case.
-            "abuseipdb": {"abuseConfidenceScore": 50, "totalReports": 6,
-                          "countryCode": "US", "isp": "Amazon.com, Inc.",
-                          "usageType": "Data Center/Web Hosting/Transit"},
-            "virustotal": {"malicious": 0, "suspicious": 0, "harmless": 65},
-            "successful_logins": {"successful_logins": 1, "accounts": ["jdoe"]},
-        },
+    # --- 2. Classify each unique IP once (one Gemini call per attacker) ---
+    report = []
+    for aggregated in by_ip.values():
+        result = classify_alert(aggregated)            # sees the summed 24h failed-attempt total
+        facts = result["facts"]
+        report.append({
+            "ip_address": aggregated["ip_address"],
+            "country": facts["country"],
+            "isp": facts["isp"],
+            "failed_attempts": facts["failed_attempts"],
+            "abuse_score": facts["abuse_score"],
+            "abuse_reports": facts["abuse_reports"],
+            "vt_malicious": facts["vt_malicious"],
+            "successful_login": facts["successful_login"],
+            "verdict": result["final"]["verdict"],     # post-rule verdict
+            "severity": result["final"]["severity"],   # post-rule severity
+            "reasoning": result["model"]["explanation"],
+        })
+
+    # --- 3. Sort: severity rank first, then abuse score descending ---
+    report.sort(key=lambda r: (SEVERITY_ORDER.get(r["severity"], 99), -(r["abuse_score"] or 0)))
+    return report
+
+
+def print_report_table(report):
+    """Print the report to the terminal as a clean fixed-width table."""
+    header = (f"{'SEVERITY':<9} {'VERDICT':<14} {'IP':<15} {'CTRY':<4} "
+              f"{'FAILS':>6} {'ABUSE':>5} {'RPTS':>6} {'VTMAL':>5} {'LOGIN':<5} ISP")
+    print(header)
+    print("-" * len(header))
+    for r in report:
+        print(f"{r['severity']:<9} {r['verdict']:<14} {_cell(r['ip_address']):<15} "
+              f"{_cell(r['country']):<4} {_cell(r['failed_attempts']):>6} "
+              f"{_cell(r['abuse_score']):>5} {_cell(r['abuse_reports']):>6} "
+              f"{_cell(r['vt_malicious']):>5} {('YES' if r['successful_login'] else 'no'):<5} "
+              f"{_truncate(r['isp'], 24)}")
+        # The one-line reasoning sits under each row, indented and truncated to fit.
+        print(f"  reason: {_truncate(r['reasoning'], 108)}")
+    print()
+
+
+def render_markdown(report, generated_at):
+    """Build the manager-facing Markdown version of the report as a single string."""
+    counts = _severity_counts(report)
+    breached = [r for r in report if r["successful_login"]]
+
+    lines = [
+        "# SOC Triage Report",
+        "",
+        f"**Generated:** {generated_at.strftime('%Y-%m-%d %H:%M:%S')}  ",
+        "**Window:** last 24 hours  ",
+        f"**Unique attacker IPs:** {len(report)}  ",
+        f"**By severity:** {counts['critical']} critical, {counts['high']} high, "
+        f"{counts['medium']} medium, {counts['low']} low  ",
+    ]
+    # Surface any actual break-ins at the top -- that is what a manager cares about most.
+    if breached:
+        ips = ", ".join(r["ip_address"] for r in breached)
+        lines.append(f"**Successful logins detected from:** {ips}  ")
+    else:
+        lines.append("**Successful logins:** none (all brute-force attempts failed)  ")
+
+    # Ranked table of every attacker.
+    lines += ["", "## Ranked alerts", "",
+              "| Severity | Verdict | IP | Country | ISP | Fails | Abuse | Reports | VT mal | Login |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in report:
+        lines.append(
+            f"| {r['severity']} | {r['verdict']} | {r['ip_address']} | {_cell(r['country'])} "
+            f"| {_cell(r['isp'])} | {r['failed_attempts']} | {_cell(r['abuse_score'])} "
+            f"| {_cell(r['abuse_reports'])} | {r['vt_malicious']} "
+            f"| {'YES' if r['successful_login'] else 'no'} |"
+        )
+
+    # Full reasoning for each IP, below the table.
+    lines += ["", "## Reasoning", ""]
+    for r in report:
+        lines.append(f"- **{r['ip_address']}** ({r['severity']} / {r['verdict']}): {r['reasoning']}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def save_reports(report):
+    """Save the report two ways into /reports: a timestamped JSON and a timestamped Markdown file."""
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)     # create the reports/ folder if missing
+    now = datetime.now()
+    stamp = now.strftime("%Y%m%d_%H%M%S")              # e.g. 20260627_143000
+
+    # 1. JSON: the full structured data, ideal for a future dashboard to load.
+    json_path = REPORTS_DIR / f"triage_report_{stamp}.json"
+    document = {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "window": "last 24 hours",
+        "total_attackers": len(report),
+        "severity_counts": _severity_counts(report),
+        "alerts": report,
     }
-    print_decision(classify_alert(synthetic_alert))
+    json_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+
+    # 2. Markdown: the human-readable, manager-facing version.
+    md_path = REPORTS_DIR / f"triage_report_{stamp}.md"
+    md_path.write_text(render_markdown(report, now), encoding="utf-8")
+
+    return json_path, md_path
+
+
+def generate_triage_report(alerts):
+    """End-to-end: classify all alerts, print the ranked table, and save JSON + Markdown."""
+    report = build_triage_report(alerts)               # classify + dedupe + sort
+    print_report_table(report)                         # clean terminal table
+    json_path, md_path = save_reports(report)          # persist both formats
+    print(f"Saved JSON report:     {json_path}")
+    print(f"Saved Markdown report: {md_path}")
+    return report
+
+
+# --- Quick manual test: run `python agent/agent.py` to build the full report ---
+if __name__ == "__main__":
+    # Pull the real alerts and enrich them (~90s due to VirusTotal throttling), then
+    # classify everything and emit the ranked, deduplicated triage report.
+    enriched = enrich_alerts(get_brute_force_alerts())
+    generate_triage_report(enriched)
